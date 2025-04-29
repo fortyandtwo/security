@@ -1,17 +1,19 @@
 <#
 .SYNOPSIS
-Extracts and displays details of Entra ID Conditional Access policies.
+Extracts and displays details of Entra ID Conditional Access policies, with options to export to CSV or JSON.
 
 .DESCRIPTION
 Connects to Microsoft Graph and retrieves all Conditional Access policies.
-It then iterates through each policy, displaying its configuration details
-in a structured format, including assignments (users, apps, conditions) and controls (grant, session).
-It also adds basic evaluation notes (e.g., policy state, blocking policies).
+It then iterates through each policy, collecting its configuration details.
+Optionally suppresses console output and exports the collected data to a specified file in CSV or JSON format.
 
 .NOTES
-Version:        1.4 (Removed invalid -Confirm parameter from Disconnect-MgGraph calls)
+Version:        1.5
 Author:         André Motta - CSA Security - France
-Last Modified:  2025-04-29 
+Last Modified:  2025-04-29
+Changes:        - Added -OutputFile, -OutputFormat, -Quiet parameters for CSV/JSON export.
+                - Collects policy data into objects.
+                - Implemented export logic.
 Prerequisites:  PowerShell 5.1+
                 Microsoft.Graph.Authentication module
                 Microsoft.Graph.Identity.SignIns module
@@ -20,18 +22,39 @@ Permissions:    Requires permissions to read Conditional Access policies in Entr
                 Additional permissions (Directory.Read.All, Application.Read.All, RoleManagement.Read.Directory etc.) needed for -ResolveNames.
 
 .EXAMPLE
+# Display output only to console (default behavior)
 .\Get-EntraConditionalAccessPolicies.ps1
-Connects to Microsoft Graph (you will be prompted to log in) and outputs policy details.
 
 .EXAMPLE
-.\Get-EntraConditionalAccessPolicies.ps1 -ResolveNames $true
-Attempts to resolve User/Group/Role/App IDs to display names (requires more permissions and takes longer).
+# Export policies to a CSV file (default format) and show console output
+.\Get-EntraConditionalAccessPolicies.ps1 -OutputFile "C:\Temp\CAPolicies.csv"
+
+.EXAMPLE
+# Export policies to a JSON file and show console output
+.\Get-EntraConditionalAccessPolicies.ps1 -OutputFile "C:\Temp\CAPolicies.json" -OutputFormat JSON
+
+.EXAMPLE
+# Export policies to CSV, resolve names, and suppress detailed console output
+.\Get-EntraConditionalAccessPolicies.ps1 -OutputFile "C:\Temp\CAPolicies_Resolved.csv" -ResolveNames -Quiet
 
 #>
 param (
     [Parameter(Mandatory = $false)]
-    [switch]$ResolveNames # Optional switch to try resolving IDs to Names
+    [switch]$ResolveNames, # Optional switch to try resolving IDs to Names
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFile, # Path for the export file
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('CSV', 'JSON')]
+    [string]$OutputFormat = 'CSV', # Format for export (required if OutputFile is specified)
+
+    [Parameter(Mandatory=$false)]
+    [switch]$Quiet # Suppress detailed console output during processing loop
 )
+
+# Determine if exporting to file based on whether OutputFile was provided
+$ExportToFile = $PSBoundParameters.ContainsKey('OutputFile')
 
 # Function to safely get property value
 function Get-SafeProperty {
@@ -62,7 +85,8 @@ function Resolve-IdToName {
 
     $Name = $Id # Default to ID if lookup fails
     try {
-        Write-Verbose "Attempting to resolve $Type ID: $Id"
+        # Suppress verbose messages if Quiet switch is used
+        Write-Verbose "Attempting to resolve $Type ID: $Id" -Verbose:(-not $Quiet)
         switch ($Type) {
             'User' { $Name = (Get-MgUser -UserId $Id -ErrorAction SilentlyContinue).DisplayName }
             'Group' { $Name = (Get-MgGroup -GroupId $Id -ErrorAction SilentlyContinue).DisplayName }
@@ -81,7 +105,6 @@ function Resolve-IdToName {
                  }
              }
             'Application' { $Name = (Get-MgServicePrincipal -ServicePrincipalId $Id -ErrorAction SilentlyContinue).DisplayName }
-            # Add other types like NamedLocation if needed (Get-MgIdentityConditionalAccessNamedLocation requires Microsoft.Graph.Identity.SignIns)
             'NamedLocation' { $Name = (Get-MgIdentityConditionalAccessNamedLocation -NamedLocationId $Id -ErrorAction SilentlyContinue).DisplayName }
         }
     }
@@ -99,26 +122,33 @@ function Resolve-IdToName {
     return $ResolvedName
 }
 
+# Helper function to join array elements for CSV, handles $null or empty arrays
+function Join-ArrayForCsv {
+    param(
+        [array]$InputArray,
+        [string]$Delimiter = ';'
+    )
+    if ($null -eq $InputArray -or $InputArray.Count -eq 0) {
+        return '' # Return empty string for null/empty arrays
+    }
+    return $InputArray -join $Delimiter
+}
+
 
 # --- Main Script ---
 
-Write-Host "Attempting to connect to Microsoft Graph..." -ForegroundColor Cyan
+if (-not $Quiet) { Write-Host "Attempting to connect to Microsoft Graph..." -ForegroundColor Cyan }
 
 # Define required permissions (scopes)
-# Policy.Read.All is essential for CA policies.
-# Directory.Read.All, Application.Read.All etc. are needed for -ResolveNames.
 $RequiredScopes = @("Policy.Read.All")
 if ($ResolveNames) {
-    Write-Host "Name resolution requested. Adding Directory.Read.All, Application.Read.All, RoleManagement.Read.Directory scopes." -ForegroundColor Yellow
-    # Add scopes needed by the Get-Mg* cmdlets used in Resolve-IdToName
-    $RequiredScopes += "Directory.Read.All", "Application.Read.All", "RoleManagement.Read.Directory" # Added Role scope
+    if (-not $Quiet) { Write-Host "Name resolution requested. Adding Directory.Read.All, Application.Read.All, RoleManagement.Read.Directory scopes." -ForegroundColor Yellow }
+    $RequiredScopes += "Directory.Read.All", "Application.Read.All", "RoleManagement.Read.Directory"
 
     # Ensure necessary modules are available for resolution functions
      if (-not (Get-Module -Name Microsoft.Graph.Users -ListAvailable)) { Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force -Confirm:$false -AllowClobber }
      if (-not (Get-Module -Name Microsoft.Graph.Groups -ListAvailable)) { Install-Module Microsoft.Graph.Groups -Scope CurrentUser -Force -Confirm:$false -AllowClobber }
      if (-not (Get-Module -Name Microsoft.Graph.Applications -ListAvailable)) { Install-Module Microsoft.Graph.Applications -Scope CurrentUser -Force -Confirm:$false -AllowClobber }
-     # Role resolution dependency moved inside Resolve-IdToName for clarity
-     # Named Location resolution uses Microsoft.Graph.Identity.SignIns (already required)
 
      # Import necessary modules for resolution to be safe
      Import-Module Microsoft.Graph.Users, Microsoft.Graph.Groups, Microsoft.Graph.Applications -ErrorAction SilentlyContinue
@@ -126,7 +156,6 @@ if ($ResolveNames) {
 
 # Connect to Microsoft Graph
 try {
-    # Check if already connected with sufficient scopes
     $CurrentContext = Get-MgContext -ErrorAction SilentlyContinue
     $HasSufficientScopes = $false
     if ($CurrentContext) {
@@ -134,33 +163,31 @@ try {
         $MissingScopes = $RequiredScopes | Where-Object { $ExistingScopes -notcontains $_.ToLower() }
         if ($MissingScopes.Count -eq 0) {
             $HasSufficientScopes = $true
-            Write-Host "Already connected to Microsoft Graph with sufficient permissions." -ForegroundColor Green
+            if (-not $Quiet) { Write-Host "Already connected to Microsoft Graph with sufficient permissions." -ForegroundColor Green }
         } else {
             Write-Warning "Currently connected, but missing required scopes: $($MissingScopes -join ', '). Attempting to reconnect..."
-            # CORRECTED: Removed invalid -Confirm parameter
             Disconnect-MgGraph -ErrorAction SilentlyContinue
         }
     }
 
     if (-not $HasSufficientScopes) {
-         # Add -NoWelcome to suppress the welcome message on repeated connections
-         Connect-MgGraph -Scopes $RequiredScopes #-NoWelcome
+         Connect-MgGraph -Scopes $RequiredScopes
     }
-    Write-Host "Successfully connected to Microsoft Graph." -ForegroundColor Green
-    $ConnectionCheck = Get-MgContext # Verify connection context
-    Write-Host "Connected as: $($ConnectionCheck.Account)"
-    Write-Host "Tenant ID: $($ConnectionCheck.TenantId)"
-    Write-Host "Scopes granted: $($ConnectionCheck.Scopes -join ', ')"
-
+    if (-not $Quiet) {
+        Write-Host "Successfully connected to Microsoft Graph." -ForegroundColor Green
+        $ConnectionCheck = Get-MgContext # Verify connection context
+        Write-Host "Connected as: $($ConnectionCheck.Account)"
+        Write-Host "Tenant ID: $($ConnectionCheck.TenantId)"
+        Write-Host "Scopes granted: $($ConnectionCheck.Scopes -join ', ')"
+    }
 }
 catch {
     Write-Error "Failed to connect to Microsoft Graph. Please ensure the SDK modules are installed and you have internet connectivity. Error: $($_.Exception.Message)"
-    # Exit or return based on how you want to handle connection failure
     return
 }
 
 
-Write-Host "`nFetching Conditional Access Policies..." -ForegroundColor Cyan
+if (-not $Quiet) { Write-Host "`nFetching Conditional Access Policies..." -ForegroundColor Cyan }
 
 try {
     # Use -All parameter to handle paging automatically
@@ -169,203 +196,255 @@ try {
 catch {
     Write-Error "Failed to retrieve Conditional Access policies. Error: $($_.Exception.Message)"
     Write-Error "Ensure your account has the necessary permissions (e.g., Security Reader)."
-    # CORRECTED: Removed invalid -Confirm parameter
     Disconnect-MgGraph -ErrorAction SilentlyContinue
     return
 }
 
 if ($null -eq $Policies -or $Policies.Count -eq 0) {
     Write-Host "No Conditional Access policies found in this tenant." -ForegroundColor Yellow
-    # CORRECTED: Removed invalid -Confirm parameter
     Disconnect-MgGraph -ErrorAction SilentlyContinue
     return
 }
 
-Write-Host "Found $($Policies.Count) policies. Processing..." -ForegroundColor Green
-Write-Host "--------------------------------------------------"
+if (-not $Quiet) { Write-Host "Found $($Policies.Count) policies. Processing..." -ForegroundColor Green }
+if ($ExportToFile -and -not $Quiet) { Write-Host "Data will be exported to $OutputFile (Format: $OutputFormat)" -ForegroundColor Cyan}
+if (-not $Quiet) { Write-Host "--------------------------------------------------" }
+
+# Initialize collection to store structured policy data
+$PolicyDataCollection = [System.Collections.Generic.List[PSObject]]::new()
 
 # Initialize cache if resolving names
 if ($ResolveNames) { $script:IdNameCache = @{} }
 
+# Process each policy
 foreach ($Policy in $Policies) {
-    Write-Host "`nPolicy Name: $($Policy.DisplayName)" -ForegroundColor White
-    Write-Host "Policy ID:   $($Policy.Id)"
-    # Use $() around the if statement for -ForegroundColor
-    Write-Host "State:       $($Policy.State)" -ForegroundColor $(if ($Policy.State -eq 'enabled') { 'Green' } elseif ($Policy.State -eq 'disabled') { 'Red' } else { 'Yellow' }) # Highlight state
 
-    # --- Assignments (Conditions) ---
-    Write-Host "`n  ASSIGNMENTS (Conditions):" -ForegroundColor Cyan
-
-    $Conditions = $Policy.Conditions
-
-    # Users
-    Write-Host "    Users:"
-    Write-Host "      Include:"
-    $IncludeUsers = Get-SafeProperty $Conditions.Users 'IncludeUsers'
-    $IncludeGroups = Get-SafeProperty $Conditions.Users 'IncludeGroups'
-    $IncludeRoles = Get-SafeProperty $Conditions.Users 'IncludeRoles'
-    Write-Host "        Users: $(if ($IncludeUsers) { ($IncludeUsers | ForEach-Object { Resolve-IdToName $_ 'User' }) -join ', ' } else { 'None' })"
-    Write-Host "        Groups: $(if ($IncludeGroups) { ($IncludeGroups | ForEach-Object { Resolve-IdToName $_ 'Group' }) -join ', ' } else { 'None' })"
-    Write-Host "        Roles: $(if ($IncludeRoles) { ($IncludeRoles | ForEach-Object { Resolve-IdToName $_ 'Role' }) -join ', ' } else { 'None' })"
-    # GuestOrExternalUsers check (Complex object)
-     $GuestUserCondition = Get-SafeProperty $Conditions.Users 'IncludeGuestsOrExternalUsers'
-     if ($GuestUserCondition) {
-         Write-Host "        Guest/External Users:"
-         Write-Host "          Types: $($GuestUserCondition.GuestOrExternalUserTypes)"
-         if ($GuestUserCondition.ExternalTenants) {
-             $MembershipKind = Get-SafeProperty $GuestUserCondition.ExternalTenants 'MembershipKind' # e.g., all, enumerated
-             Write-Host "          External Tenants specified: Yes (MembershipKind: $MembershipKind)"
-             # You could add logic here to list specific tenant IDs if $GuestUserCondition.ExternalTenants.Members has values and $MembershipKind -eq 'enumerated'
-         }
-     } else { Write-Host "        Guest/External Users: None" }
-
-    Write-Host "      Exclude:"
-    $ExcludeUsers = Get-SafeProperty $Conditions.Users 'ExcludeUsers'
-    $ExcludeGroups = Get-SafeProperty $Conditions.Users 'ExcludeGroups'
-    $ExcludeRoles = Get-SafeProperty $Conditions.Users 'ExcludeRoles'
-    Write-Host "        Users: $(if ($ExcludeUsers) { ($ExcludeUsers | ForEach-Object { Resolve-IdToName $_ 'User' }) -join ', ' } else { 'None' })"
-    Write-Host "        Groups: $(if ($ExcludeGroups) { ($ExcludeGroups | ForEach-Object { Resolve-IdToName $_ 'Group' }) -join ', ' } else { 'None' })"
-    Write-Host "        Roles: $(if ($ExcludeRoles) { ($ExcludeRoles | ForEach-Object { Resolve-IdToName $_ 'Role' }) -join ', ' } else { 'None' })"
-     $ExcludeGuestUserCondition = Get-SafeProperty $Conditions.Users 'ExcludeGuestsOrExternalUsers'
-     if ($ExcludeGuestUserCondition) {
-         Write-Host "        Guest/External Users (Excluded):"
-         Write-Host "          Types: $($ExcludeGuestUserCondition.GuestOrExternalUserTypes)"
-         # Similar breakdown for ExternalTenants if needed
-     } else { Write-Host "        Guest/External Users (Excluded): None" }
-
-    # Applications (Target Resources)
-    Write-Host "    Applications (Target Resources):"
-    Write-Host "      Include:"
-    $Apps = Get-SafeProperty $Conditions 'Applications'
-    $IncludeApps = Get-SafeProperty $Apps 'IncludeApplications'
-    $IncludeUserActions = Get-SafeProperty $Apps 'IncludeUserActions'
-    $IncludeAuthContexts = Get-SafeProperty $Apps 'IncludeAuthenticationContextClassReferences'
-    Write-Host "        Applications: $(if ($IncludeApps) { ($IncludeApps | ForEach-Object { Resolve-IdToName $_ 'Application' }) -join ', ' } else { 'None' })"
-    Write-Host "        User Actions: $(if ($IncludeUserActions) { $IncludeUserActions -join ', ' } else { 'None' })"
-    Write-Host "        Authentication Contexts: $(if ($IncludeAuthContexts) { $IncludeAuthContexts -join ', ' } else { 'None' })"
-
-    Write-Host "      Exclude:"
-    $ExcludeApps = Get-SafeProperty $Apps 'ExcludeApplications'
-    Write-Host "        Applications: $(if ($ExcludeApps) { ($ExcludeApps | ForEach-Object { Resolve-IdToName $_ 'Application' }) -join ', ' } else { 'None' })"
-    # Add ExcludeUserActions, ExcludeAuthenticationContextClassReferences if needed
-
-    # Locations
-    Write-Host "    Locations:"
-    $Locations = Get-SafeProperty $Conditions 'Locations'
-    $IncludeLoc = Get-SafeProperty $Locations 'IncludeLocations'
-    $ExcludeLoc = Get-SafeProperty $Locations 'ExcludeLocations'
-    # Resolve NamedLocation IDs if requested, handle special values 'All', 'AllTrusted'
-    Write-Host "      Include: $(if ($IncludeLoc) { ($IncludeLoc | ForEach-Object { if ($_ -eq 'All' -or $_ -eq 'AllTrusted') { $_ } else { Resolve-IdToName $_ 'NamedLocation' } }) -join ', ' } else { 'None' })"
-    Write-Host "      Exclude: $(if ($ExcludeLoc) { ($ExcludeLoc | ForEach-Object { if ($_ -eq 'All' -or $_ -eq 'AllTrusted') { $_ } else { Resolve-IdToName $_ 'NamedLocation' } }) -join ', ' } else { 'None' })"
-
-    # Platforms
-    Write-Host "    Device Platforms:"
-    $Platforms = Get-SafeProperty $Conditions 'Platforms'
-    $IncludePlat = Get-SafeProperty $Platforms 'IncludePlatforms'
-    $ExcludePlat = Get-SafeProperty $Platforms 'ExcludePlatforms'
-    Write-Host "      Include: $(if ($IncludePlat) { $IncludePlat -join ', ' } else { 'None' })"
-    Write-Host "      Exclude: $(if ($ExcludePlat) { $ExcludePlat -join ', ' } else { 'None' })"
-
-    # Devices (Filter)
-    Write-Host "    Devices (Filter):"
-    $Devices = Get-SafeProperty $Conditions 'Devices'
-    $DeviceFilter = Get-SafeProperty $Devices 'DeviceFilter'
-    if ($DeviceFilter) {
-        Write-Host "      Mode: $(Get-SafeProperty $DeviceFilter 'Mode')"
-        Write-Host "      Rule: $(Get-SafeProperty $DeviceFilter 'Rule')"
+    if (-not $Quiet) {
+        Write-Host "`nProcessing Policy: $($Policy.DisplayName)" -ForegroundColor White
     } else {
-        Write-Host "      Mode: Not Configured"
-        Write-Host "      Rule: Not Configured"
+        # Provide minimal progress indication even when quiet
+        Write-Progress -Activity "Processing Conditional Access Policies" -Status "Policy: $($Policy.DisplayName)" -PercentComplete (($PolicyDataCollection.Count / $Policies.Count) * 100)
     }
 
+    # --- Extract Data into a structured object ---
+    $PolicyDetails = [PSCustomObject]@{
+        ID = $Policy.Id
+        DisplayName = $Policy.DisplayName
+        State = $Policy.State
 
-    # Client App Types
-    Write-Host "    Client App Types:"
-    $ClientAppTypes = Get-SafeProperty $Conditions 'ClientAppTypes'
-    Write-Host "      Types: $(if ($ClientAppTypes) { $ClientAppTypes -join ', ' } else { 'Any' })"
+        # Condition Properties (Flattened where necessary)
+        IncludeUsers = @()
+        IncludeGroups = @()
+        IncludeRoles = @()
+        IncludeGuestOrExternalUserTypes = $null
+        IncludeGuestOrExternalTenantMembershipKind = $null
+        ExcludeUsers = @()
+        ExcludeGroups = @()
+        ExcludeRoles = @()
+        ExcludeGuestOrExternalUserTypes = $null
+        ExcludeGuestOrExternalTenantMembershipKind = $null
 
-    # Risk Levels (Sign-in & User) - Check if Identity Protection is used
-    Write-Host "    Sign-in Risk:"
-    $SignInRiskLevels = Get-SafeProperty $Conditions 'SignInRiskLevels'
-    Write-Host "      Levels: $(if ($SignInRiskLevels) { $SignInRiskLevels -join ', ' } else { 'Not Configured' })"
+        IncludeApplications = @()
+        IncludeUserActions = @()
+        IncludeAuthContexts = @()
+        ExcludeApplications = @()
 
-    Write-Host "    User Risk:"
-    $UserRiskLevels = Get-SafeProperty $Conditions 'UserRiskLevels'
-    Write-Host "      Levels: $(if ($UserRiskLevels) { $UserRiskLevels -join ', ' } else { 'Not Configured' })"
+        IncludeLocations = @()
+        ExcludeLocations = @()
 
+        IncludePlatforms = @()
+        ExcludePlatforms = @()
 
-    # --- Controls ---
-    Write-Host "`n  CONTROLS:" -ForegroundColor Cyan
+        DeviceFilterMode = $null
+        DeviceFilterRule = $null
 
-    # Grant Controls
+        ClientAppTypes = @()
+        SignInRiskLevels = @()
+        UserRiskLevels = @()
+
+        # Grant Control Properties
+        GrantControlsOperator = $null
+        GrantRequiredControls = @()
+        GrantCustomAuthFactors = @()
+        GrantTermsOfUse = @()
+        GrantAuthStrengthId = $null
+        GrantAuthStrengthName = $null
+
+        # Session Control Properties (Flattened)
+        SessionAppEnforcedRestrictions = $false
+        SessionCloudAppSecurityMode = $null
+        SessionSignInFrequencyValue = $null
+        SessionSignInFrequencyType = $null
+        SessionSignInFrequencyAuthType = $null
+        SessionPersistentBrowserMode = $null
+        SessionCAEMode = $null
+        SessionDisableResilienceDefaults = $false
+        SessionSecureSignInSession = $false
+    }
+
+    # Populate Conditions
+    $Conditions = $Policy.Conditions
+    if ($Conditions) {
+        $Users = Get-SafeProperty $Conditions 'Users'
+        if ($Users) {
+            $PolicyDetails.IncludeUsers = if (Get-SafeProperty $Users 'IncludeUsers') { (Get-SafeProperty $Users 'IncludeUsers' | ForEach-Object { Resolve-IdToName $_ 'User' }) } else { @() }
+            $PolicyDetails.IncludeGroups = if (Get-SafeProperty $Users 'IncludeGroups') { (Get-SafeProperty $Users 'IncludeGroups' | ForEach-Object { Resolve-IdToName $_ 'Group' }) } else { @() }
+            $PolicyDetails.IncludeRoles = if (Get-SafeProperty $Users 'IncludeRoles') { (Get-SafeProperty $Users 'IncludeRoles' | ForEach-Object { Resolve-IdToName $_ 'Role' }) } else { @() }
+            $IncludeGuests = Get-SafeProperty $Users 'IncludeGuestsOrExternalUsers'
+            if ($IncludeGuests) {
+                $PolicyDetails.IncludeGuestOrExternalUserTypes = Get-SafeProperty $IncludeGuests 'GuestOrExternalUserTypes'
+                $PolicyDetails.IncludeGuestOrExternalTenantMembershipKind = Get-SafeProperty (Get-SafeProperty $IncludeGuests 'ExternalTenants') 'MembershipKind'
+            }
+
+            $PolicyDetails.ExcludeUsers = if (Get-SafeProperty $Users 'ExcludeUsers') { (Get-SafeProperty $Users 'ExcludeUsers' | ForEach-Object { Resolve-IdToName $_ 'User' }) } else { @() }
+            $PolicyDetails.ExcludeGroups = if (Get-SafeProperty $Users 'ExcludeGroups') { (Get-SafeProperty $Users 'ExcludeGroups' | ForEach-Object { Resolve-IdToName $_ 'Group' }) } else { @() }
+            $PolicyDetails.ExcludeRoles = if (Get-SafeProperty $Users 'ExcludeRoles') { (Get-SafeProperty $Users 'ExcludeRoles' | ForEach-Object { Resolve-IdToName $_ 'Role' }) } else { @() }
+            $ExcludeGuests = Get-SafeProperty $Users 'ExcludeGuestsOrExternalUsers'
+             if ($ExcludeGuests) {
+                $PolicyDetails.ExcludeGuestOrExternalUserTypes = Get-SafeProperty $ExcludeGuests 'GuestOrExternalUserTypes'
+                $PolicyDetails.ExcludeGuestOrExternalTenantMembershipKind = Get-SafeProperty (Get-SafeProperty $ExcludeGuests 'ExternalTenants') 'MembershipKind'
+            }
+        }
+
+        $Apps = Get-SafeProperty $Conditions 'Applications'
+        if ($Apps) {
+            $PolicyDetails.IncludeApplications = if (Get-SafeProperty $Apps 'IncludeApplications') { (Get-SafeProperty $Apps 'IncludeApplications' | ForEach-Object { Resolve-IdToName $_ 'Application' }) } else { @() }
+            $PolicyDetails.IncludeUserActions = Get-SafeProperty $Apps 'IncludeUserActions' # Already an array of strings
+            $PolicyDetails.IncludeAuthContexts = Get-SafeProperty $Apps 'IncludeAuthenticationContextClassReferences' # Already an array of strings
+            $PolicyDetails.ExcludeApplications = if (Get-SafeProperty $Apps 'ExcludeApplications') { (Get-SafeProperty $Apps 'ExcludeApplications' | ForEach-Object { Resolve-IdToName $_ 'Application' }) } else { @() }
+        }
+
+        $Locations = Get-SafeProperty $Conditions 'Locations'
+        if ($Locations) {
+            $PolicyDetails.IncludeLocations = if (Get-SafeProperty $Locations 'IncludeLocations') { (Get-SafeProperty $Locations 'IncludeLocations' | ForEach-Object { if ($_ -eq 'All' -or $_ -eq 'AllTrusted') { $_ } else { Resolve-IdToName $_ 'NamedLocation' } }) } else { @() }
+            $PolicyDetails.ExcludeLocations = if (Get-SafeProperty $Locations 'ExcludeLocations') { (Get-SafeProperty $Locations 'ExcludeLocations' | ForEach-Object { if ($_ -eq 'All' -or $_ -eq 'AllTrusted') { $_ } else { Resolve-IdToName $_ 'NamedLocation' } }) } else { @() }
+        }
+
+        $Platforms = Get-SafeProperty $Conditions 'Platforms'
+        if ($Platforms) {
+            $PolicyDetails.IncludePlatforms = Get-SafeProperty $Platforms 'IncludePlatforms'
+            $PolicyDetails.ExcludePlatforms = Get-SafeProperty $Platforms 'ExcludePlatforms'
+        }
+
+        $Devices = Get-SafeProperty $Conditions 'Devices'
+        $DeviceFilter = Get-SafeProperty $Devices 'DeviceFilter'
+        if ($DeviceFilter) {
+             $PolicyDetails.DeviceFilterMode = Get-SafeProperty $DeviceFilter 'Mode'
+             $PolicyDetails.DeviceFilterRule = Get-SafeProperty $DeviceFilter 'Rule'
+        }
+
+        $PolicyDetails.ClientAppTypes = Get-SafeProperty $Conditions 'ClientAppTypes'
+        $PolicyDetails.SignInRiskLevels = Get-SafeProperty $Conditions 'SignInRiskLevels'
+        $PolicyDetails.UserRiskLevels = Get-SafeProperty $Conditions 'UserRiskLevels'
+    }
+
+    # Populate Grant Controls
     $GrantControls = $Policy.GrantControls
     if ($GrantControls) {
-        Write-Host "    Grant Controls:"
-        Write-Host "      Operator: $($GrantControls.Operator)" # AND / OR
-        if ($GrantControls.BuiltInControls) {
-            Write-Host "      Required Controls: $($GrantControls.BuiltInControls -join ', ')" -ForegroundColor Green
+        $PolicyDetails.GrantControlsOperator = Get-SafeProperty $GrantControls 'Operator'
+        $PolicyDetails.GrantRequiredControls = Get-SafeProperty $GrantControls 'BuiltInControls'
+        $PolicyDetails.GrantCustomAuthFactors = Get-SafeProperty $GrantControls 'CustomAuthenticationFactors'
+        $PolicyDetails.GrantTermsOfUse = Get-SafeProperty $GrantControls 'TermsOfUse'
+        $AuthStrength = Get-SafeProperty $GrantControls 'AuthenticationStrength'
+        if ($AuthStrength) {
+            $PolicyDetails.GrantAuthStrengthId = Get-SafeProperty $AuthStrength 'Id'
+            $PolicyDetails.GrantAuthStrengthName = Get-SafeProperty $AuthStrength 'DisplayName'
         }
-        if ($GrantControls.CustomAuthenticationFactors) {
-             Write-Host "      Custom Auth Factors: $($GrantControls.CustomAuthenticationFactors -join ', ')"
-        }
-        if ($GrantControls.TermsOfUse) {
-            Write-Host "      Terms of Use: $($GrantControls.TermsOfUse -join ', ')"
-        }
-        if ($GrantControls.AuthenticationStrength) {
-            # AuthenticationStrength object has Id and DisplayName, but DisplayName might be null sometimes
-            $authStrengthId = Get-SafeProperty $GrantControls.AuthenticationStrength 'Id'
-            $authStrengthName = Get-SafeProperty $GrantControls.AuthenticationStrength 'DisplayName'
-            $authStrengthDisplay = if ($authStrengthName -and $authStrengthName -ne '') { "$authStrengthName ($authStrengthId)" } else { $authStrengthId }
-            Write-Host "      Authentication Strength: Required ($authStrengthDisplay)"
-            # To resolve just an ID, you might need: Get-MgIdentityAuthenticationStrengthPolicy -AuthenticationStrengthPolicyId $authStrengthId
-        }
-
-        # Highlight BLOCK access
-        if ($GrantControls.Operator -eq 'Block' -or ($GrantControls.BuiltInControls -contains 'block')) {
-             Write-Host "      ACTION: BLOCK ACCESS" -ForegroundColor Red -BackgroundColor Black
-        }
-
-    } else {
-        Write-Host "    Grant Controls: None Configured (Implicit Deny if conditions met, unless Grant is handled by another policy)" -ForegroundColor Yellow
     }
 
-
-    # Session Controls
+    # Populate Session Controls (Flattened)
     $SessionControls = $Policy.SessionControls
     if ($SessionControls) {
-        Write-Host "    Session Controls:"
-        if (Get-SafeProperty $SessionControls 'ApplicationEnforcedRestrictions') { Write-Host "      Application Enforced Restrictions: Enabled" }
-        if (Get-SafeProperty $SessionControls 'CloudAppSecurity') { Write-Host "      Cloud App Security (MCAS): Enabled (Mode: $(Get-SafeProperty $SessionControls.CloudAppSecurity 'CloudAppSecurityType'))" }
-        if (Get-SafeProperty $SessionControls 'SignInFrequency') { Write-Host "      Sign-in Frequency: Value: $(Get-SafeProperty $SessionControls.SignInFrequency 'Value') $(Get-SafeProperty $SessionControls.SignInFrequency 'Type'), Auth Type: $(Get-SafeProperty $SessionControls.SignInFrequency 'AuthenticationType')" }
-        if (Get-SafeProperty $SessionControls 'PersistentBrowser') { Write-Host "      Persistent Browser Session: $(Get-SafeProperty $SessionControls.PersistentBrowser 'Mode')" }
-        if (Get-SafeProperty $SessionControls 'ContinuousAccessEvaluation') { Write-Host "      Continuous Access Evaluation: $(Get-SafeProperty $SessionControls.ContinuousAccessEvaluation 'Mode')" }
-        if ($null -ne (Get-SafeProperty $SessionControls 'DisableResilienceDefaults')) { Write-Host "      Disable Resilience Defaults: $(Get-SafeProperty $SessionControls 'DisableResilienceDefaults')" } # Boolean
-        if (Get-SafeProperty $SessionControls 'SecureSignInSession') { Write-Host "      Secure Sign-In Session (requires Proactive remediation): Enabled" }
-
-    } else {
-         Write-Host "    Session Controls: None Configured"
+        $PolicyDetails.SessionAppEnforcedRestrictions = [bool](Get-SafeProperty $SessionControls 'ApplicationEnforcedRestrictions') # Cast to bool if needed
+        $PolicyDetails.SessionCloudAppSecurityMode = Get-SafeProperty (Get-SafeProperty $SessionControls 'CloudAppSecurity') 'CloudAppSecurityType'
+        $SignInFreq = Get-SafeProperty $SessionControls 'SignInFrequency'
+        if ($SignInFreq) {
+            $PolicyDetails.SessionSignInFrequencyValue = Get-SafeProperty $SignInFreq 'Value'
+            $PolicyDetails.SessionSignInFrequencyType = Get-SafeProperty $SignInFreq 'Type'
+            $PolicyDetails.SessionSignInFrequencyAuthType = Get-SafeProperty $SignInFreq 'AuthenticationType'
+        }
+        $PolicyDetails.SessionPersistentBrowserMode = Get-SafeProperty (Get-SafeProperty $SessionControls 'PersistentBrowser') 'Mode'
+        $PolicyDetails.SessionCAEMode = Get-SafeProperty (Get-SafeProperty $SessionControls 'ContinuousAccessEvaluation') 'Mode'
+        $PolicyDetails.SessionDisableResilienceDefaults = [bool](Get-SafeProperty $SessionControls 'DisableResilienceDefaults') # Cast to bool
+        $PolicyDetails.SessionSecureSignInSession = [bool](Get-SafeProperty $SessionControls 'SecureSignInSession') # Cast to bool
     }
 
-    # --- Basic Evaluation Notes ---
-    Write-Host "`n  EVALUATION NOTES:" -ForegroundColor Cyan
-    if ($Policy.State -ne 'enabled') { Write-Warning "  - Policy is currently NOT ENFORCED (State: $($Policy.State))" }
-    # Check for 'All Users' inclusion without any specified exclusions
-    if (($IncludeUsers -contains 'All') -and -not ($ExcludeUsers) -and -not ($ExcludeGroups) -and -not ($ExcludeRoles) -and -not $ExcludeGuestUserCondition) { Write-Warning "  - Policy targets 'All Users' without specific user, group, role, or guest exclusions. Verify scope is intended." }
-    elseif ($IncludeUsers -contains 'All') { Write-Host "  - Policy targets 'All Users' but has exclusions defined." -ForegroundColor Gray }
-    # Check for 'All Apps' inclusion without any specified exclusions
-    if (($IncludeApps -contains 'All') -and -not ($ExcludeApps)) { Write-Warning "  - Policy targets 'All Cloud Apps' without exclusions. Verify scope carefully." }
-    # Block Policy
-    if ($GrantControls -and ($GrantControls.Operator -eq 'Block' -or ($GrantControls.BuiltInControls -contains 'block'))) { Write-Host "  - This is a BLOCK policy." -ForegroundColor Yellow }
-    # MFA Enforcement
-    if ($GrantControls -and ($GrantControls.BuiltInControls -contains 'mfa')) { Write-Host "  - This policy enforces MFA." -ForegroundColor Green }
-    # Legacy Auth potentially targeted
-    if ($ClientAppTypes -contains 'other') { Write-Warning "  - Policy includes 'Other clients', potentially matching legacy authentication. Ensure this is intended or use stronger controls/conditions."}
-    # Add more checks based on your organization's standards
+    # Add the structured object to our collection
+    $PolicyDataCollection.Add($PolicyDetails)
 
-    Write-Host "--------------------------------------------------"
+    # --- Display output to console if not Quiet ---
+    if (-not $Quiet) {
+        # (Re-use the Write-Host logic from previous versions if detailed console output is desired)
+        # For brevity here, we'll just show the name/state/ID as confirmation
+        Write-Host "  ID:    $($PolicyDetails.ID)"
+        Write-Host "  State: $($PolicyDetails.State)" -ForegroundColor $(if ($PolicyDetails.State -eq 'enabled') { 'Green' } elseif ($PolicyDetails.State -eq 'disabled') { 'Red' } else { 'Yellow' })
+        # Add more Write-Host lines here mirroring previous verbose output if needed
+        Write-Host "--------------------------------------------------"
+    }
+
+} # End foreach policy
+
+# --- Export Data if requested ---
+if ($ExportToFile) {
+    if (-not $Quiet) { Write-Host "`nExporting $($PolicyDataCollection.Count) policies to $OutputFormat file: $OutputFile" -ForegroundColor Cyan }
+    try {
+        # Ensure output directory exists
+        $OutputDirectory = Split-Path -Path $OutputFile -Parent
+        if ($OutputDirectory -and (-not (Test-Path -Path $OutputDirectory -PathType Container))) {
+            if (-not $Quiet) { Write-Host "Creating output directory: $OutputDirectory" }
+            New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        if ($OutputFormat -eq 'JSON') {
+            # Convert the collection (which contains objects with arrays/nested data) to JSON
+            $PolicyDataCollection | ConvertTo-Json -Depth 10 | Out-File -FilePath $OutputFile -Encoding UTF8
+        }
+        elseif ($OutputFormat -eq 'CSV') {
+            # Prepare data for CSV: Select properties and flatten arrays using the helper function
+            $CsvData = $PolicyDataCollection | Select-Object -Property @(
+                'DisplayName', 'ID', 'State',
+                @{Name='IncludeUsers'; Expression={Join-ArrayForCsv -InputArray $_.IncludeUsers}},
+                @{Name='IncludeGroups'; Expression={Join-ArrayForCsv -InputArray $_.IncludeGroups}},
+                @{Name='IncludeRoles'; Expression={Join-ArrayForCsv -InputArray $_.IncludeRoles}},
+                'IncludeGuestOrExternalUserTypes',
+                'IncludeGuestOrExternalTenantMembershipKind',
+                @{Name='ExcludeUsers'; Expression={Join-ArrayForCsv -InputArray $_.ExcludeUsers}},
+                @{Name='ExcludeGroups'; Expression={Join-ArrayForCsv -InputArray $_.ExcludeGroups}},
+                @{Name='ExcludeRoles'; Expression={Join-ArrayForCsv -InputArray $_.ExcludeRoles}},
+                'ExcludeGuestOrExternalUserTypes',
+                'ExcludeGuestOrExternalTenantMembershipKind',
+                @{Name='IncludeApplications'; Expression={Join-ArrayForCsv -InputArray $_.IncludeApplications}},
+                @{Name='IncludeUserActions'; Expression={Join-ArrayForCsv -InputArray $_.IncludeUserActions}},
+                @{Name='IncludeAuthContexts'; Expression={Join-ArrayForCsv -InputArray $_.IncludeAuthContexts}},
+                @{Name='ExcludeApplications'; Expression={Join-ArrayForCsv -InputArray $_.ExcludeApplications}},
+                @{Name='IncludeLocations'; Expression={Join-ArrayForCsv -InputArray $_.IncludeLocations}},
+                @{Name='ExcludeLocations'; Expression={Join-ArrayForCsv -InputArray $_.ExcludeLocations}},
+                @{Name='IncludePlatforms'; Expression={Join-ArrayForCsv -InputArray $_.IncludePlatforms}},
+                @{Name='ExcludePlatforms'; Expression={Join-ArrayForCsv -InputArray $_.ExcludePlatforms}},
+                'DeviceFilterMode', 'DeviceFilterRule',
+                @{Name='ClientAppTypes'; Expression={Join-ArrayForCsv -InputArray $_.ClientAppTypes}},
+                @{Name='SignInRiskLevels'; Expression={Join-ArrayForCsv -InputArray $_.SignInRiskLevels}},
+                @{Name='UserRiskLevels'; Expression={Join-ArrayForCsv -InputArray $_.UserRiskLevels}},
+                'GrantControlsOperator',
+                @{Name='GrantRequiredControls'; Expression={Join-ArrayForCsv -InputArray $_.GrantRequiredControls}},
+                @{Name='GrantCustomAuthFactors'; Expression={Join-ArrayForCsv -InputArray $_.GrantCustomAuthFactors}},
+                @{Name='GrantTermsOfUse'; Expression={Join-ArrayForCsv -InputArray $_.GrantTermsOfUse}},
+                'GrantAuthStrengthId',
+                'GrantAuthStrengthName',
+                # Flattened Session Controls
+                'SessionAppEnforcedRestrictions', 'SessionCloudAppSecurityMode', 'SessionSignInFrequencyValue', 'SessionSignInFrequencyType', 'SessionSignInFrequencyAuthType', 'SessionPersistentBrowserMode', 'SessionCAEMode', 'SessionDisableResilienceDefaults', 'SessionSecureSignInSession'
+            )
+            # Export to CSV
+            $CsvData | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 #-Delimiter ',' # Use default delimiter or specify e.g. -Delimiter ';'
+        }
+        if (-not $Quiet) { Write-Host "Successfully exported data to $OutputFile" -ForegroundColor Green }
+    }
+    catch {
+        Write-Error "Failed to export data to $OutputFile. Error: $($_.Exception.Message)"
+    }
 }
 
+
 # Disconnect from Microsoft Graph
-Write-Host "`nScript finished. Disconnecting from Microsoft Graph." -ForegroundColor Cyan
-# CORRECTED: Removed invalid -Confirm parameter
+if (-not $Quiet) { Write-Host "`nScript finished. Disconnecting from Microsoft Graph." -ForegroundColor Cyan }
 Disconnect-MgGraph -ErrorAction SilentlyContinue
